@@ -116,14 +116,11 @@ public:
 
 private:
     bool loadResources(FilamentAsset* asset, bool async);
-    bool createTextures(details::FFilamentAsset* asset, bool async); // TODO move to impl
     void applySparseData(details::FFilamentAsset* asset) const;
     void computeTangents(details::FFilamentAsset* asset) const;
     void normalizeSkinningWeights(details::FFilamentAsset* asset) const;
     void updateBoundingBoxes(details::FFilamentAsset* asset) const;
     details::AssetPool* mPool;
-    const ResourceConfiguration mConfig;
-
     struct Impl;
     Impl* pImpl;
 };

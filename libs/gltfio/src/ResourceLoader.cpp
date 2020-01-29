@@ -80,6 +80,7 @@ namespace {
 namespace gltfio {
 
 struct ResourceLoader::Impl {
+    ResourceConfiguration mConfig;
 
     // User-provided resource data with URL string keys, populated via addResourceData().
     tsl::robin_map<std::string, BufferDescriptor> mUserCache;
@@ -88,8 +89,10 @@ struct ResourceLoader::Impl {
     TextureCache mTextureCache;
     utils::JobSystem::Job* mDecodingJob = nullptr;
 
-    void addTextureCacheEntry(const TextureBinding& tb, Path directory);
+    bool createTextures(details::FFilamentAsset* asset, bool async);
+    void addTextureCacheEntry(const TextureBinding& tb);
     void bindTextureToMaterial(const TextureBinding& tb);
+    void uploadPendingTextures();
 };
 
 namespace details {
@@ -137,7 +140,9 @@ private:
 using namespace details;
 
 ResourceLoader::ResourceLoader(const ResourceConfiguration& config) :
-        mPool(new AssetPool), mConfig(config), pImpl(new Impl) {}
+        mPool(new AssetPool), pImpl(new Impl) {
+    pImpl->mConfig = config;
+}
 
 ResourceLoader::~ResourceLoader() {
     mPool->onLoaderDestroyed();
@@ -250,7 +255,7 @@ bool ResourceLoader::loadResources(FilamentAsset* asset, bool async) {
     #else
 
     // Read data from the file system and base64 URLs.
-    cgltf_result result = cgltf_load_buffers(&options, gltf, mConfig.gltfPath.c_str());
+    cgltf_result result = cgltf_load_buffers(&options, gltf, pImpl->mConfig.gltfPath.c_str());
     if (result != cgltf_result_success) {
         slog.e << "Unable to load resources." << io::endl;
         return false;
@@ -270,13 +275,15 @@ bool ResourceLoader::loadResources(FilamentAsset* asset, bool async) {
     // places, this will needlessly repeat the work. In the future we would like to remove this
     // feature, and instead simply require correct models. See also:
     // https://github.com/KhronosGroup/glTF-Sample-Models/issues/215
-    if (mConfig.normalizeSkinningWeights) {
+    if (pImpl->mConfig.normalizeSkinningWeights) {
         normalizeSkinningWeights(fasset);
     }
 
-    if (mConfig.recomputeBoundingBoxes) {
+    if (pImpl->mConfig.recomputeBoundingBoxes) {
         updateBoundingBoxes(fasset);
     }
+
+    Engine& engine = *pImpl->mConfig.engine;
 
     // Upload data to the GPU.
     const BufferBinding* bindings = asset->getBufferBindings();
@@ -292,29 +299,29 @@ bool ResourceLoader::loadResources(FilamentAsset* asset, bool async) {
             const uint8_t* data8 = bb.offset + (const uint8_t*) *bb.data;
             mPool->addPendingUpload();
             VertexBuffer::BufferDescriptor bd(data8, bb.size, AssetPool::onLoadedResource, mPool);
-            bb.vertexBuffer->setBufferAt(*mConfig.engine, bb.bufferIndex, std::move(bd));
+            bb.vertexBuffer->setBufferAt(engine, bb.bufferIndex, std::move(bd));
         } else if (bb.vertexBuffer) {
             uint32_t* dummyData = (uint32_t*) malloc(bb.size);
             memset(dummyData, 0xff, bb.size);
             VertexBuffer::BufferDescriptor bd(dummyData, bb.size, FREE_CALLBACK);
-            bb.vertexBuffer->setBufferAt(*mConfig.engine, bb.bufferIndex, std::move(bd));
+            bb.vertexBuffer->setBufferAt(engine, bb.bufferIndex, std::move(bd));
         } else if (bb.generateTrivialIndices) {
             uint32_t* data32 = (uint32_t*) malloc(bb.size);
             generateTrivialIndices(data32, bb.size / sizeof(uint32_t));
             IndexBuffer::BufferDescriptor bd(data32, bb.size, FREE_CALLBACK);
-            bb.indexBuffer->setBuffer(*mConfig.engine, std::move(bd));
+            bb.indexBuffer->setBuffer(engine, std::move(bd));
         } else if (bb.convertBytesToShorts) {
             const uint8_t* data8 = bb.offset + (const uint8_t*) *bb.data;
             size_t size16 = bb.size * 2;
             uint16_t* data16 = (uint16_t*) malloc(size16);
             convertBytesToShorts(data16, data8, bb.size);
             IndexBuffer::BufferDescriptor bd(data16, size16, FREE_CALLBACK);
-            bb.indexBuffer->setBuffer(*mConfig.engine, std::move(bd));
+            bb.indexBuffer->setBuffer(engine, std::move(bd));
         } else if (bb.indexBuffer) {
             const uint8_t* data8 = bb.offset + (const uint8_t*) *bb.data;
             mPool->addPendingUpload();
             IndexBuffer::BufferDescriptor bd(data8, bb.size, AssetPool::onLoadedResource, mPool);
-            bb.indexBuffer->setBuffer(*mConfig.engine, std::move(bd));
+            bb.indexBuffer->setBuffer(engine, std::move(bd));
         }
     }
 
@@ -335,7 +342,7 @@ bool ResourceLoader::loadResources(FilamentAsset* asset, bool async) {
     }
 
     // Finally, load image files and create Filament Textures.
-    return createTextures(fasset, async);
+    return pImpl->createTextures(fasset, async);
 }
 
 bool ResourceLoader::asyncBeginLoad(FilamentAsset* asset) {
@@ -349,6 +356,10 @@ float ResourceLoader::asyncGetLoadProgress() const {
 }
 
 void ResourceLoader::asyncUpdateLoad() {
+    pImpl->uploadPendingTextures();
+}
+
+void ResourceLoader::Impl::uploadPendingTextures() {
     auto upload = [](TextureCacheEntry* entry, Engine& engine) {
         Texture* texture = entry->texture;
         uint8_t* texels = entry->texels;
@@ -362,16 +373,14 @@ void ResourceLoader::asyncUpdateLoad() {
             entry->texels = nullptr;
         }
     };
-    for (auto& pair : pImpl->mTextureCache.bufferTextureCache) {
-        upload(pair.second.get(), *mConfig.engine);
-    }
-    for (auto& pair : pImpl->mTextureCache.urlTextureCache) {
-        upload(pair.second.get(), *mConfig.engine);
-    }
+    Engine& engine = *mConfig.engine;
+    for (auto& pair : mTextureCache.bufferTextureCache) upload(pair.second.get(), engine);
+    for (auto& pair : mTextureCache.urlTextureCache) upload(pair.second.get(), engine);
 }
 
-void ResourceLoader::Impl::addTextureCacheEntry(const TextureBinding& tb, Path directory) {
+void ResourceLoader::Impl::addTextureCacheEntry(const TextureBinding& tb) {
     TextureCacheEntry* entry = nullptr;
+    const Path directory = mConfig.gltfPath.getParent();
 
     // Check if the texture binding uses BufferView data (i.e. it does not have a URL).
     BufferTextureCache& bufTextureCache = mTextureCache.bufferTextureCache;
@@ -435,16 +444,16 @@ void ResourceLoader::Impl::bindTextureToMaterial(const TextureBinding& tb) {
     }
 }
 
-bool ResourceLoader::createTextures(details::FFilamentAsset* asset, bool async) {
-    BufferTextureCache& bufTextureCache = pImpl->mTextureCache.bufferTextureCache;
-    UrlTextureCache& urlTextureCache = pImpl->mTextureCache.urlTextureCache;
+bool ResourceLoader::Impl::createTextures(details::FFilamentAsset* asset, bool async) {
+    BufferTextureCache& bufTextureCache = mTextureCache.bufferTextureCache;
+    UrlTextureCache& urlTextureCache = mTextureCache.urlTextureCache;
 
     // In the first pass, perform synchronous work, such as determining the image size and creating
     // empty filament::Texture objects. This creates cache entries but does not do any decoding.
 
-    pImpl->mTextureCache.numRequiredTextures++;
+    mTextureCache.numRequiredTextures++;
     for (size_t i = 0, n = asset->getTextureBindingCount(); i < n; ++i) {
-        pImpl->addTextureCacheEntry(asset->getTextureBindings()[i], mConfig.gltfPath.getParent());
+        addTextureCacheEntry(asset->getTextureBindings()[i]);
     }
 
     auto createTexture = [=](TextureCacheEntry* entry) {
@@ -461,7 +470,7 @@ bool ResourceLoader::createTextures(details::FFilamentAsset* asset, bool async) 
     for (auto& pair : urlTextureCache) createTexture(pair.second.get());
 
     for (size_t i = 0, n = asset->getTextureBindingCount(); i < n; ++i) {
-        pImpl->bindTextureToMaterial(asset->getTextureBindings()[i]);
+        bindTextureToMaterial(asset->getTextureBindings()[i]);
     }
 
     utils::JobSystem* js = utils::JobSystem::getJobSystem();
@@ -475,7 +484,7 @@ bool ResourceLoader::createTextures(details::FFilamentAsset* asset, bool async) 
             int width, height, comp;
             entry->texels = stbi_load_from_memory(sourceData, entry->bufferSize,
                     &width, &height, &comp, 4);
-            pImpl->mTextureCache.numFinishedTextures++;
+            mTextureCache.numFinishedTextures++;
         });
         js->run(decode);
     }
@@ -486,14 +495,14 @@ bool ResourceLoader::createTextures(details::FFilamentAsset* asset, bool async) 
         TextureCacheEntry* entry = pair.second.get();
 
         // First, check the user-supplied resource cache for this URL.
-        auto iter = pImpl->mUserCache.find(uri);
-        if (iter != pImpl->mUserCache.end()) {
+        auto iter = mUserCache.find(uri);
+        if (iter != mUserCache.end()) {
             const uint8_t* sourceData = (const uint8_t*) iter->second.buffer;
             utils::JobSystem::Job* decode = utils::jobs::createJob(*js, parent, [=] {
                 int width, height, comp;
                 entry->texels = stbi_load_from_memory(sourceData, iter->second.size, &width,
                         &height, &comp, 4);
-                pImpl->mTextureCache.numFinishedTextures++;
+                mTextureCache.numFinishedTextures++;
             });
             js->run(decode);
             continue;
@@ -508,14 +517,14 @@ bool ResourceLoader::createTextures(details::FFilamentAsset* asset, bool async) 
             utils::JobSystem::Job* decode = utils::jobs::createJob(*js, parent, [=] {
                 int width, height, comp;
                 entry->texels = stbi_load(fullpath.c_str(), &width, &height, &comp, 4);
-                pImpl->mTextureCache.numFinishedTextures++;
+                mTextureCache.numFinishedTextures++;
             });
             js->run(decode);
         #endif
     }
 
     if (async) {
-        pImpl->mDecodingJob = js->runAndRetain(parent);
+        mDecodingJob = js->runAndRetain(parent);
         return true;
     }
 
@@ -523,7 +532,7 @@ bool ResourceLoader::createTextures(details::FFilamentAsset* asset, bool async) 
     js->runAndWait(parent);
 
     // Finally, upload texels to the GPU and generate mipmaps.
-    asyncUpdateLoad();
+    uploadPendingTextures();
 
     return true;
 }
@@ -535,7 +544,7 @@ void ResourceLoader::applySparseData(FFilamentAsset* asset) const {
         float* generated = (float*) malloc(numBytes);
         cgltf_accessor_unpack_floats(accessor, generated, numFloats);
         VertexBuffer::BufferDescriptor bd(generated, numBytes, FREE_CALLBACK);
-        vb->setBufferAt(*mConfig.engine, slot, std::move(bd));
+        vb->setBufferAt(*pImpl->mConfig.engine, slot, std::move(bd));
     };
 
     // Collect all vertex attribute slots that need to be populated.
@@ -683,7 +692,7 @@ void ResourceLoader::computeTangents(FFilamentAsset* asset) const {
 
         // Upload quaternions to the GPU.
         VertexBuffer::BufferDescriptor bd(quats, vertexCount * sizeof(short4), FREE_CALLBACK);
-        vb->setBufferAt(*mConfig.engine, slot, std::move(bd));
+        vb->setBufferAt(*pImpl->mConfig.engine, slot, std::move(bd));
     };
 
     // Collect all TANGENT vertex attribute slots that need to be populated.
@@ -757,8 +766,8 @@ void ResourceLoader::normalizeSkinningWeights(details::FFilamentAsset* asset) co
 }
 
 void ResourceLoader::updateBoundingBoxes(details::FFilamentAsset* asset) const {
-    auto& rm = mConfig.engine->getRenderableManager();
-    auto& tm = mConfig.engine->getTransformManager();
+    auto& rm = pImpl->mConfig.engine->getRenderableManager();
+    auto& tm = pImpl->mConfig.engine->getTransformManager();
 
     // The purpose of the root node is to give the client a place for custom transforms.
     // Since it is not part of the source model, it should be ignored when computing the
