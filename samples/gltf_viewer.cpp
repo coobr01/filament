@@ -230,6 +230,10 @@ int main(int argc, char** argv) {
         loadResources(filename);
 
         app.viewer->setUiCallback([&app, scene] () {
+            float progress = app.resourceLoader->asyncGetLoadProgress();
+            if (progress < 1.0) {
+                ImGui::ProgressBar(progress);
+            }
             if (ImGui::CollapsingHeader("Stats")) {
                 ImGui::Text("%zu entities in the asset", app.asset->getEntityCount());
                 ImGui::Text("%zu renderables (excluding UI)", scene->getRenderableCount());
