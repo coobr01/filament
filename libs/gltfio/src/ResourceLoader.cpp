@@ -71,8 +71,8 @@ namespace {
     struct TextureCache {
         BufferTextureCache bufferTextureCache;
         UrlTextureCache urlTextureCache;
-        int numRequiredTextures = 0;
-        std::atomic<int> numFinishedTextures;
+        int numCacheEntries;
+        std::atomic<int> numReadyEntries;
     };
 
 }
@@ -350,8 +350,8 @@ bool ResourceLoader::asyncBeginLoad(FilamentAsset* asset) {
 }
 
 float ResourceLoader::asyncGetLoadProgress() const {
-    const float finished = pImpl->mTextureCache.numFinishedTextures;
-    const float total = pImpl->mTextureCache.numRequiredTextures;
+    const float finished = pImpl->mTextureCache.numReadyEntries;
+    const float total = pImpl->mTextureCache.numCacheEntries;
     return finished / total;
 }
 
@@ -394,7 +394,7 @@ void ResourceLoader::Impl::addTextureCacheEntry(const TextureBinding& tb) {
         entry->srgb = tb.srgb;
         stbi_info_from_memory(sourceData, tb.totalSize, &entry->width, &entry->height,
                 &entry->numComponents);
-        mTextureCache.numRequiredTextures++;
+        mTextureCache.numCacheEntries++;
         entry->bufferSize = tb.totalSize;
     }
 
@@ -414,7 +414,7 @@ void ResourceLoader::Impl::addTextureCacheEntry(const TextureBinding& tb) {
         const uint8_t* sourceData = (const uint8_t*) iter->second.buffer;
         stbi_info_from_memory(sourceData, iter->second.size, &entry->width,
                 &entry->height, &entry->numComponents);
-        mTextureCache.numRequiredTextures++;
+        mTextureCache.numCacheEntries++;
         return;
     }
     #if defined(STBI_NO_STDIO)
@@ -422,7 +422,7 @@ void ResourceLoader::Impl::addTextureCacheEntry(const TextureBinding& tb) {
     #else
         utils::Path fullpath = directory + tb.uri;
         stbi_info(fullpath.c_str(), &entry->width, &entry->height, &entry->numComponents);
-        mTextureCache.numRequiredTextures++;
+        mTextureCache.numCacheEntries++;
     #endif
 }
 
@@ -451,7 +451,7 @@ bool ResourceLoader::Impl::createTextures(details::FFilamentAsset* asset, bool a
     // In the first pass, perform synchronous work, such as determining the image size and creating
     // empty filament::Texture objects. This creates cache entries but does not do any decoding.
 
-    mTextureCache.numRequiredTextures++;
+    mTextureCache.numCacheEntries = 0;
     for (size_t i = 0, n = asset->getTextureBindingCount(); i < n; ++i) {
         addTextureCacheEntry(asset->getTextureBindings()[i]);
     }
@@ -476,6 +476,8 @@ bool ResourceLoader::Impl::createTextures(details::FFilamentAsset* asset, bool a
     utils::JobSystem* js = utils::JobSystem::getJobSystem();
     utils::JobSystem::Job* parent = js->createJob();
 
+    mTextureCache.numReadyEntries = 0;
+
     // Kick off jobs that decode texels from buffer pointers.
     for (auto& pair : bufTextureCache) {
         const uint8_t* sourceData = (const uint8_t*) pair.first;
@@ -484,7 +486,7 @@ bool ResourceLoader::Impl::createTextures(details::FFilamentAsset* asset, bool a
             int width, height, comp;
             entry->texels = stbi_load_from_memory(sourceData, entry->bufferSize,
                     &width, &height, &comp, 4);
-            mTextureCache.numFinishedTextures++;
+            mTextureCache.numReadyEntries++;
         });
         js->run(decode);
     }
@@ -502,7 +504,7 @@ bool ResourceLoader::Impl::createTextures(details::FFilamentAsset* asset, bool a
                 int width, height, comp;
                 entry->texels = stbi_load_from_memory(sourceData, iter->second.size, &width,
                         &height, &comp, 4);
-                mTextureCache.numFinishedTextures++;
+                mTextureCache.numReadyEntries++;
             });
             js->run(decode);
             continue;
@@ -517,7 +519,7 @@ bool ResourceLoader::Impl::createTextures(details::FFilamentAsset* asset, bool a
             utils::JobSystem::Job* decode = utils::jobs::createJob(*js, parent, [=] {
                 int width, height, comp;
                 entry->texels = stbi_load(fullpath.c_str(), &width, &height, &comp, 4);
-                mTextureCache.numFinishedTextures++;
+                mTextureCache.numReadyEntries++;
             });
             js->run(decode);
         #endif

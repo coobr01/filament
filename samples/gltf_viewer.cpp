@@ -205,10 +205,7 @@ int main(int argc, char** argv) {
 
         // Load animation data then free the source hierarchy.
         app.asset->getAnimator();
-//      app.asset->releaseSourceData();
-
-        // Add the renderables to the scene.
-        app.viewer->setAsset(app.asset, !app.actualSize);
+        app.asset->releaseSourceData();
 
         auto ibl = FilamentApp::get().getIBL();
         if (ibl) {
@@ -256,6 +253,12 @@ int main(int argc, char** argv) {
 
     auto animate = [&app](Engine* engine, View* view, double now) {
         app.resourceLoader->asyncUpdateLoad();
+
+        // Add the renderables to the scene after the textures have finished loading.
+        if (app.resourceLoader->asyncGetLoadProgress() == 1.0f) {
+            app.viewer->setAsset(app.asset, !app.actualSize);
+        }
+
         app.viewer->applyAnimation(now);
     };
 
