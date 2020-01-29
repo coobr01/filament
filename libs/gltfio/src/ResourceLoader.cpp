@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019 The Android Open Source Project
+ * Copyright (C) 2020 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -61,20 +61,6 @@ namespace {
 
     using BufferTextureCache = tsl::robin_map<const void*, std::unique_ptr<TextureCacheEntry>>;
     using UrlTextureCache = tsl::robin_map<std::string, std::unique_ptr<TextureCacheEntry>>;
-
-    // The resource loader's transient texture cache holds decoded texture data during
-    // loadResources(). It is discarded when all Filament Texture objects have been created and
-    // uploaded. The "texels" pointers are populated from secondary threads that have been spawned
-    // by the job system. Since multiple glTF textures might be loaded from a single URL or buffer
-    // pointer, the cache prevents needless re-decoding. The cache is split into two maps: one for
-    // URL-based textures and one for buffer-based textures.
-    struct TextureCache {
-        BufferTextureCache bufferTextureCache;
-        UrlTextureCache urlTextureCache;
-        int numCacheEntries;
-        std::atomic<int> numReadyEntries;
-    };
-
 }
 
 namespace gltfio {
@@ -83,10 +69,18 @@ struct ResourceLoader::Impl {
     ResourceConfiguration mConfig;
 
     // User-provided resource data with URL string keys, populated via addResourceData().
+    // This is used on platforms without traditional file systems, such as Android and WebGL.
     tsl::robin_map<std::string, BufferDescriptor> mUserCache;
 
-    // Transient bookkeeping structure for loadResources().
-    TextureCache mTextureCache;
+    // The resource loader's transient texture cache holds decoded texture data during
+    // loadResources(). It is discarded when all Filament Texture objects have been created and
+    // uploaded. Since multiple glTF textures might be loaded from a single URL or buffer pointer,
+    // the cache prevents needless re-decoding. The cache is split into two maps: one for URL-based
+    // textures and one for buffer-based textures.
+    BufferTextureCache mBufferTextureCache;
+    UrlTextureCache mUrlTextureCache;
+    int mNumCacheEntries;
+    std::atomic<int> mNumReadyEntries;
     utils::JobSystem::Job* mDecodingJob = nullptr;
 
     bool createTextures(details::FFilamentAsset* asset, bool async);
@@ -181,20 +175,20 @@ static void generateTrivialIndices(uint32_t* dst, size_t numVertices) {
 }
 
 bool ResourceLoader::loadResources(FilamentAsset* asset) {
-    return loadResources(asset, false);
+    FFilamentAsset* fasset = upcast(asset);
+    return loadResources(fasset, false);
 }
 
-bool ResourceLoader::loadResources(FilamentAsset* asset, bool async) {
-    FFilamentAsset* fasset = upcast(asset);
-    if (fasset->mResourcesLoaded) {
+bool ResourceLoader::loadResources(FFilamentAsset* asset, bool async) {
+    if (asset->mResourcesLoaded) {
         return false;
     }
-    fasset->mResourcesLoaded = true;
-    mPool->addAsset(fasset);
-    auto gltf = (cgltf_data*) fasset->mSourceAsset;
+    asset->mResourcesLoaded = true;
+    mPool->addAsset(asset);
+    auto gltf = (cgltf_data*) asset->mSourceAsset;
     cgltf_options options {};
 
-    // For emscripten and android builds we have a custom implementation of cgltf_load_buffers which
+    // For emscripten and Android builds we have a custom implementation of cgltf_load_buffers which
     // looks inside a cache of externally-supplied data blobs, rather than loading from the
     // filesystem.
 
@@ -276,11 +270,11 @@ bool ResourceLoader::loadResources(FilamentAsset* asset, bool async) {
     // feature, and instead simply require correct models. See also:
     // https://github.com/KhronosGroup/glTF-Sample-Models/issues/215
     if (pImpl->mConfig.normalizeSkinningWeights) {
-        normalizeSkinningWeights(fasset);
+        normalizeSkinningWeights(asset);
     }
 
     if (pImpl->mConfig.recomputeBoundingBoxes) {
-        updateBoundingBoxes(fasset);
+        updateBoundingBoxes(asset);
     }
 
     Engine& engine = *pImpl->mConfig.engine;
@@ -327,31 +321,31 @@ bool ResourceLoader::loadResources(FilamentAsset* asset, bool async) {
 
     // Copy over the inverse bind matrices to allow users to destroy the source asset.
     for (cgltf_size i = 0, len = gltf->skins_count; i < len; ++i) {
-        importSkinningData(fasset->mSkins[i], gltf->skins[i]);
+        importSkinningData(asset->mSkins[i], gltf->skins[i]);
     }
 
     // Apply sparse data modifications to base arrays, then upload the result.
     if (needsSparseData) {
-        applySparseData(fasset);
+        applySparseData(asset);
     }
 
     // Compute surface orientation quaternions if necessary. This is similar to sparse data in that
     // we need to generate the contents of a GPU buffer by processing one or more CPU buffer(s).
     if (needsTangents) {
-        computeTangents(fasset);
+        computeTangents(asset);
     }
 
     // Finally, load image files and create Filament Textures.
-    return pImpl->createTextures(fasset, async);
+    return pImpl->createTextures(asset, async);
 }
 
 bool ResourceLoader::asyncBeginLoad(FilamentAsset* asset) {
-    return loadResources(asset, true);
+    return loadResources(upcast(asset), true);
 }
 
 float ResourceLoader::asyncGetLoadProgress() const {
-    const float finished = pImpl->mTextureCache.numReadyEntries;
-    const float total = pImpl->mTextureCache.numCacheEntries;
+    const float finished = pImpl->mNumReadyEntries;
+    const float total = pImpl->mNumCacheEntries;
     return finished / total;
 }
 
@@ -374,8 +368,8 @@ void ResourceLoader::Impl::uploadPendingTextures() {
         }
     };
     Engine& engine = *mConfig.engine;
-    for (auto& pair : mTextureCache.bufferTextureCache) upload(pair.second.get(), engine);
-    for (auto& pair : mTextureCache.urlTextureCache) upload(pair.second.get(), engine);
+    for (auto& pair : mBufferTextureCache) upload(pair.second.get(), engine);
+    for (auto& pair : mUrlTextureCache) upload(pair.second.get(), engine);
 }
 
 void ResourceLoader::Impl::addTextureCacheEntry(const TextureBinding& tb) {
@@ -383,29 +377,27 @@ void ResourceLoader::Impl::addTextureCacheEntry(const TextureBinding& tb) {
     const Path directory = mConfig.gltfPath.getParent();
 
     // Check if the texture binding uses BufferView data (i.e. it does not have a URL).
-    BufferTextureCache& bufTextureCache = mTextureCache.bufferTextureCache;
     if (tb.data) {
         const uint8_t* sourceData = tb.offset + (const uint8_t*) *tb.data;
-        entry = bufTextureCache[sourceData] ? bufTextureCache[sourceData].get() : nullptr;
+        entry = mBufferTextureCache[sourceData] ? mBufferTextureCache[sourceData].get() : nullptr;
         if (entry) {
             return;
         }
-        entry = (bufTextureCache[sourceData] = std::make_unique<TextureCacheEntry>()).get();
+        entry = (mBufferTextureCache[sourceData] = std::make_unique<TextureCacheEntry>()).get();
         entry->srgb = tb.srgb;
         stbi_info_from_memory(sourceData, tb.totalSize, &entry->width, &entry->height,
                 &entry->numComponents);
-        mTextureCache.numCacheEntries++;
+        mNumCacheEntries++;
         entry->bufferSize = tb.totalSize;
     }
 
     // Check if we already created a Texture object for this URL.
-    UrlTextureCache& urlTextureCache = mTextureCache.urlTextureCache;
-    entry = urlTextureCache[tb.uri] ? urlTextureCache[tb.uri].get() : nullptr;
+    entry = mUrlTextureCache[tb.uri] ? mUrlTextureCache[tb.uri].get() : nullptr;
     if (entry) {
         return;
     }
 
-    entry = (urlTextureCache[tb.uri] = std::make_unique<TextureCacheEntry>()).get();
+    entry = (mUrlTextureCache[tb.uri] = std::make_unique<TextureCacheEntry>()).get();
     entry->srgb = tb.srgb;
 
     // Check the user-supplied resource cache for this URL, otherwise peek at the file.
@@ -414,7 +406,7 @@ void ResourceLoader::Impl::addTextureCacheEntry(const TextureBinding& tb) {
         const uint8_t* sourceData = (const uint8_t*) iter->second.buffer;
         stbi_info_from_memory(sourceData, iter->second.size, &entry->width,
                 &entry->height, &entry->numComponents);
-        mTextureCache.numCacheEntries++;
+        mNumCacheEntries++;
         return;
     }
     #if defined(STBI_NO_STDIO)
@@ -422,7 +414,7 @@ void ResourceLoader::Impl::addTextureCacheEntry(const TextureBinding& tb) {
     #else
         utils::Path fullpath = directory + tb.uri;
         stbi_info(fullpath.c_str(), &entry->width, &entry->height, &entry->numComponents);
-        mTextureCache.numCacheEntries++;
+        mNumCacheEntries++;
     #endif
 }
 
@@ -430,7 +422,7 @@ void ResourceLoader::Impl::bindTextureToMaterial(const TextureBinding& tb) {
     // First check if this is a buffer-based texture.
     if (tb.data) {
         const uint8_t* sourceData = tb.offset + (const uint8_t*) *tb.data;
-        auto& entry = mTextureCache.bufferTextureCache[sourceData];
+        auto& entry = mBufferTextureCache[sourceData];
         if (entry.get() && entry->texture) {
             tb.materialInstance->setParameter(tb.materialParameter, entry->texture, tb.sampler);
         }
@@ -438,24 +430,20 @@ void ResourceLoader::Impl::bindTextureToMaterial(const TextureBinding& tb) {
     }
 
     // Next check if this is a URL-based texture.
-    auto& entry = mTextureCache.urlTextureCache[tb.uri];
+    auto& entry = mUrlTextureCache[tb.uri];
     if (entry.get() && entry->texture) {
         tb.materialInstance->setParameter(tb.materialParameter, entry->texture, tb.sampler);
     }
 }
 
 bool ResourceLoader::Impl::createTextures(details::FFilamentAsset* asset, bool async) {
-    BufferTextureCache& bufTextureCache = mTextureCache.bufferTextureCache;
-    UrlTextureCache& urlTextureCache = mTextureCache.urlTextureCache;
-
-    // In the first pass, perform synchronous work, such as determining the image size and creating
-    // empty filament::Texture objects. This creates cache entries but does not do any decoding.
-
-    mTextureCache.numCacheEntries = 0;
+    // First, determine texture dimensions and create texture cache entries.
+    mNumCacheEntries = 0;
     for (size_t i = 0, n = asset->getTextureBindingCount(); i < n; ++i) {
         addTextureCacheEntry(asset->getTextureBindings()[i]);
     }
 
+    // Next create blank Filament textures.
     auto createTexture = [=](TextureCacheEntry* entry) {
         entry->texture = Texture::Builder()
             .width(entry->width)
@@ -465,34 +453,33 @@ bool ResourceLoader::Impl::createTextures(details::FFilamentAsset* asset, bool a
             .build(*mConfig.engine);
         asset->mTextures.push_back(entry->texture);
     };
+    for (auto& pair : mBufferTextureCache) createTexture(pair.second.get());
+    for (auto& pair : mUrlTextureCache) createTexture(pair.second.get());
 
-    for (auto& pair : bufTextureCache) createTexture(pair.second.get());
-    for (auto& pair : urlTextureCache) createTexture(pair.second.get());
-
+    // Bind the textures to material instances.
     for (size_t i = 0, n = asset->getTextureBindingCount(); i < n; ++i) {
         bindTextureToMaterial(asset->getTextureBindings()[i]);
     }
 
     utils::JobSystem* js = utils::JobSystem::getJobSystem();
     utils::JobSystem::Job* parent = js->createJob();
-
-    mTextureCache.numReadyEntries = 0;
+    mNumReadyEntries = 0;
 
     // Kick off jobs that decode texels from buffer pointers.
-    for (auto& pair : bufTextureCache) {
+    for (auto& pair : mBufferTextureCache) {
         const uint8_t* sourceData = (const uint8_t*) pair.first;
         TextureCacheEntry* entry = pair.second.get();
         utils::JobSystem::Job* decode = utils::jobs::createJob(*js, parent, [=] {
             int width, height, comp;
             entry->texels = stbi_load_from_memory(sourceData, entry->bufferSize,
                     &width, &height, &comp, 4);
-            mTextureCache.numReadyEntries++;
+            mNumReadyEntries++;
         });
         js->run(decode);
     }
 
     // Kick off jobs that decode texels from URL strings.
-    for (auto& pair : urlTextureCache) {
+    for (auto& pair : mUrlTextureCache) {
         auto uri = pair.first;
         TextureCacheEntry* entry = pair.second.get();
 
@@ -504,13 +491,13 @@ bool ResourceLoader::Impl::createTextures(details::FFilamentAsset* asset, bool a
                 int width, height, comp;
                 entry->texels = stbi_load_from_memory(sourceData, iter->second.size, &width,
                         &height, &comp, 4);
-                mTextureCache.numReadyEntries++;
+                mNumReadyEntries++;
             });
             js->run(decode);
             continue;
         }
 
-        // Otherwise load it from the file system, if this platform has allows it.
+        // Otherwise load it from the file system if this platform supports it.
         #if defined(STBI_NO_STDIO)
             slog.e << "Unable to load texture: " << tb.uri << io::endl;
             return false;
@@ -519,7 +506,7 @@ bool ResourceLoader::Impl::createTextures(details::FFilamentAsset* asset, bool a
             utils::JobSystem::Job* decode = utils::jobs::createJob(*js, parent, [=] {
                 int width, height, comp;
                 entry->texels = stbi_load(fullpath.c_str(), &width, &height, &comp, 4);
-                mTextureCache.numReadyEntries++;
+                mNumReadyEntries++;
             });
             js->run(decode);
         #endif
